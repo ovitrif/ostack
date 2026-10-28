@@ -7,7 +7,7 @@ description: >-
   accounts, or says sessions or sidebar groups are missing after a switch.
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.1.1"
 ---
 
 # Claude Switch
