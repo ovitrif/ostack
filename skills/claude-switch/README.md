@@ -43,38 +43,20 @@ Use these in a Claude Code terminal session with the skill installed. Replace `w
 ### Switch in one prompt
 
 ```text
-Use the claude-switch skill to switch the Claude desktop app from work to personal.
-Check the current state, save a sidebar baseline, and show the detected open-pane
-sessions. Proceed with the switch if the checks are clear; ask only if something
-is ambiguous. Wake all sessions that were open in app panes, including idle or
-paused sessions. Afterwards, verify the sidebar against the baseline and check
-that those sessions resumed and any Remote Control sessions reconnected. Report
-any differences or checks you could not complete.
+Use claude-switch to switch the desktop app from work to personal and resume my open panes.
 ```
 
 ### Check first, then switch
 
-First, preview the sidebar and switch plan without changing accounts:
-
 ```text
-Use the claude-switch skill for a dry run from work to personal. Do not switch
-accounts or restart anything yet. Save a sidebar baseline and print its readable
-tree with groups, nested sessions and IDs. Show the open-pane sessions that would
-be woken, including idle or paused sessions, and what the switch would carry.
-Distinguish stored sidebar data from Remote Control or other rows that need a
-separate app check. Flag meaningful differences or uncertainty; archived sessions
-should stay archived and out of the visible sidebar. Wait for my go.
+Use claude-switch to dry-run work → personal. Show the sidebar as text and which
+open panes will resume. Wait for my go before switching.
 ```
 
-After reviewing the output, send:
+After reviewing the output:
 
 ```text
-Go ahead with the work to personal switch using the claude-switch skill. Refresh
-the baseline and open-pane list before quitting so any changes since the dry run
-are included. Wake all sessions that were open in app panes, including idle or
-paused sessions. Verify the sidebar against that baseline, check the resumed
-panes and Remote Control connections, and report any differences or checks you
-could not complete.
+Go ahead with the switch.
 ```
 
 ## Daily switch, step by step
