@@ -47,7 +47,10 @@ WAKER_CMD = os.environ.get("CLAUDE_APP_WAKER_CMD", CONFIG.get("waker_cmd", ""))
 # The prompt each woken session gets; {email} is the account it is back on. Override with CLAUDE_APP_WAKE_TEXT.
 WAKE_TEXT = os.environ.get("CLAUDE_APP_WAKE_TEXT") or CONFIG.get("wake_text") or (
     "app-switch: you are back on {email}; re-read your latest checkpoint or notes and the messages you had not "
-    "answered yet, then resume where you left off")
+    "answered yet, then resume where you left off. Check your existing helpers and delegated work against "
+    "their current status; resume idle helpers with unfinished authorized work and confirm they respond. "
+    "Do not duplicate running work or restart completed, archived, or user-paused work. Report anything "
+    "you could not resume; a restored session ID alone does not prove work resumed.")
 
 
 def accounts():

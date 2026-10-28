@@ -84,7 +84,8 @@ Go ahead with the switch.
    ```
 
    Exit 0 means the represented local data matches; exit 1 reports differences and exit 2 means data-source issues make verification inconclusive. Remote Control/cloud rows and unsaved UI changes require a separate agent check; the local snapshot does not claim to cover them. The session also checks leftover "Offline" Remote Control rows after a restart.
-7. **First time on an account only:** turn on Bypass permissions in Settings → Claude Code, if you use it. That consent is per account.
+7. **Resume delegated work.** Woken parent sessions check their existing helpers and resume unfinished work. They confirm responses without restarting completed work or duplicating running tasks. A restored sidebar alone does not prove the work resumed.
+8. **First time on an account only:** turn on Bypass permissions in Settings → Claude Code, if you use it. That consent is per account.
 
 Next time, resume the same switch session, say "switch to work", and review the detected open-pane list.
 
