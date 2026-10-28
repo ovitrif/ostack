@@ -1,0 +1,7 @@
+interface:
+  display_name: "Claude Switch"
+  short_description: "Switch Claude accounts while preserving desktop sessions"
+  default_prompt: "Use $claude-switch to switch Claude Code and the Claude app to another account with `app_switch.py <account>` from a terminal, use sidebar_state.py snapshot/tree before and verify after, then check that requested sessions woke; port the groups with the runbook when they changed."
+
+policy:
+  allow_implicit_invocation: true
