@@ -1,0 +1,7 @@
+interface:
+  display_name: "Bro"
+  short_description: "Shortest factual rewrite of a bloated reply"
+  default_prompt: "Use $bro to rewrite your previous reply as the shortest factual version: result first, what needs me, then bullets, every fact kept."
+
+policy:
+  allow_implicit_invocation: false
