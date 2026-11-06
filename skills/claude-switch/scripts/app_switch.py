@@ -5,6 +5,7 @@
   app_switch.py <account> --dry-run  print the plan and save a baseline without changing app data
   app_switch.py <account> --from <a>  name the account left, when the record of the last switch is wrong
   app_switch.py <account> --wake <s,…>  wake exactly these sessions (titles or local ids), overriding the open-pane default
+  app_switch.py --wake-only <s,…>    wake these app sessions now, without switching (no per-sender cap)
 
 An account never signed in to the app is signed in first: every app window quits, only its
 profile opens, and the switch waits for you to sign in.
@@ -51,6 +52,12 @@ WAKE_TEXT = os.environ.get("CLAUDE_APP_WAKE_TEXT") or CONFIG.get("wake_text") or
     "their current status; resume idle helpers with unfinished authorized work and confirm they respond. "
     "Do not duplicate running work or restart completed, archived, or user-paused work. Report anything "
     "you could not resume; a restored session ID alone does not prove work resumed.")
+WAKE_ONLY = f"uv run --with pyyaml --with plyvel-ci python {HERE / 'app_switch.py'} --wake-only"
+# Appended to every wake text, the configured one included: mechanics the session needs whatever its text says.
+WAKE_SUFFIX = (f" The app stops your messages to other app sessions after 10; wake the rest with `{WAKE_ONLY} <id,…>`, "
+               "which types the wake into each and has no cap. In your report, name every MCP server that needs "
+               "signing in again (/mcp).")
+LOGIN_BROKEN = ("re-login needed", "foreign credential")
 
 
 def accounts():
@@ -63,6 +70,21 @@ def resolve(name):
         if name in (n, a.get("alias"), a.get("email")):
             return n, a
     sys.exit(f"no stored account {name!r}; see `cswap list`")
+
+
+def check_login(slot, acct):
+    """Stop before anything changes when cswap holds no working login for the target."""
+    try:
+        data = json.loads(subprocess.run(["cswap", "list", "--json"], capture_output=True, text=True, timeout=90).stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(f"login: could not read `cswap list --json` ({error}); not checked")
+        return
+    entry = next((a for a in data.get("accounts", []) if str(a.get("number")) == str(slot)), None)
+    status = (entry or {}).get("usageStatus")
+    if status in LOGIN_BROKEN:
+        sys.exit(f"login: cswap reports {status!r} for {acct['email']}. In a terminal run `claude`, `/login` as "
+                 f"{acct['email']}, `/exit`, then `cswap add`; then run this again.")
+    print(f"login: {acct['email']} ok in cswap (usageStatus {status!r})")
 
 
 def app_pids():
@@ -308,28 +330,158 @@ def shell_prefix(pane):
     return head if head.rstrip().endswith(";") else ""
 
 
+def tmux_out(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.strip()
+
+
+def keeper(tmux_session, session_id):
+    """The LaunchAgent that recreates this tmux session when it is missing and resumes this same conversation
+    (a keeper started with `--resume <id>`): a loaded job whose label ends in `.<session name>` and whose
+    arguments name the session id. A keeper that would start a fresh conversation does not count."""
+    out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        label = line.split()[-1] if line.split() else ""
+        if not label.endswith("." + tmux_session):
+            continue
+        try:
+            import plistlib
+            args = plistlib.loads((Path.home() / f"Library/LaunchAgents/{label}.plist").read_bytes()).get("ProgramArguments", [])
+        except (OSError, ValueError):
+            continue
+        if session_id and session_id in " ".join(args):
+            return label
+    return None
+
+
+def pane_cli(pane, old_pid=None):
+    """The live Claude Code process in a tmux pane, from its session file, other than `old_pid`."""
+    for meta in (Path.home() / ".claude/sessions").glob("*.json"):
+        m = record(meta) or {}
+        pid, where = m.get("pid"), m.get("tmux") or ""
+        if pid and pid != old_pid and where.split(".")[-1] == pane:
+            try:
+                os.kill(pid, 0)
+                return m
+            except (ProcessLookupError, PermissionError):
+                continue
+    return None
+
+
+def wait_for_cli(pane, old_pid, seconds):
+    for _ in range(seconds):
+        m = pane_cli(pane, old_pid)
+        if m:
+            return m
+        time.sleep(1)
+    return None
+
+
+def ensure_remote_control(pane, name):
+    """A restarted CLI can come up with Remote Control disconnected; `/remote-control` reconnects it."""
+    for attempt in range(2):
+        time.sleep(15)
+        tail = "\n".join(tmux_out("capture-pane", "-p", "-t", pane).splitlines()[-15:])
+        if "Remote Control disconnected" not in tail:
+            return "connected" if attempt else "no disconnect shown"
+        subprocess.run(["tmux", "send-keys", "-l", "-t", pane, "/remote-control"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+        print(f"  {name}: Remote Control was disconnected; sent /remote-control")
+    return "still disconnected; run /remote-control in that pane"
+
+
 def restart_remote_control(email, dry, clis=None):
-    """Resume existing tmux CLIs under the new account."""
+    """Resume existing tmux CLIs under the new account. A pane kept by a LaunchAgent is never typed into
+    while it is on a shell: its tmux session is killed, the keeper recreates it with the same conversation,
+    and the wake goes into the new Claude prompt. Other panes get the resume command only when on a shell."""
     clis = remote_control_clis() if clis is None else clis
-    text = WAKE_TEXT.format(email=email)
+    text = WAKE_TEXT.format(email=email) + WAKE_SUFFIX
+    restarted = []
     for c in clis:
-        print(f"{'would restart' if dry else 'restarting'} {c['name']} in tmux pane {c['pane']} (session {c['session']})")
+        tmux_session = tmux_out("display", "-p", "-t", c["pane"], "#{session_name}")
+        job = keeper(tmux_session, c["session"]) if tmux_session else None
+        how = f"recreated by {job}" if job else "resumed in its shell"
+        print(f"{'would restart' if dry else 'restarting'} {c['name']} in tmux pane {c['pane']} "
+              f"(session {c['session']}; {how})")
         if dry:
             continue
-        os.kill(c["pid"], signal.SIGTERM)
-        for _ in range(30):
-            try:
-                os.kill(c["pid"], 0)
-                time.sleep(1)
-            except ProcessLookupError:
-                break
-        else:
-            raise RuntimeError(f"CLI in {c['pane']} did not exit; not sending a shell command")
-        time.sleep(2)
-        cmd = c["prefix"] + " ".join(shlex.quote(a) for a in c["argv"] + ["--resume", c["session"], text])
-        subprocess.run(["tmux", "send-keys", "-l", "-t", c["pane"], cmd], check=True)
-        subprocess.run(["tmux", "send-keys", "-t", c["pane"], "Enter"], check=True)
-    return clis
+        try:
+            if job:
+                subprocess.run(["tmux", "kill-session", "-t", tmux_session], check=True)
+                for _ in range(90):  # a keeper polls (30 s is common); launchd may throttle a restart
+                    time.sleep(1)
+                    if tmux_out("list-panes", "-t", tmux_session, "-F", "#{pane_id}"):
+                        break
+                else:
+                    raise RuntimeError(f"{job} did not recreate tmux session {tmux_session} in 90 s")
+                c["pane"] = tmux_out("list-panes", "-t", tmux_session, "-F", "#{pane_id}").splitlines()[0]
+                m = wait_for_cli(c["pane"], c["pid"], 60)
+                if not m:
+                    raise RuntimeError("the recreated pane started no Claude Code in 60 s")
+                time.sleep(10)  # the prompt is ready
+                subprocess.run(["tmux", "send-keys", "-l", "-t", c["pane"], text], check=True)
+                subprocess.run(["tmux", "send-keys", "-t", c["pane"], "Enter"], check=True)
+            else:
+                if pane_cli(c["pane"]):
+                    os.kill(c["pid"], signal.SIGTERM)
+                    for _ in range(30):
+                        if not pane_cli(c["pane"]):
+                            break
+                        time.sleep(1)
+                    else:
+                        raise RuntimeError("the CLI did not exit; not sending a shell command")
+                time.sleep(2)
+                shell = tmux_out("display", "-p", "-t", c["pane"], "#{pane_current_command}")
+                if shell not in ("zsh", "bash", "sh", "fish", "-zsh", "-bash"):
+                    raise RuntimeError(f"pane runs {shell!r}, not a shell; not typing into it")
+                cmd = c["prefix"] + " ".join(shlex.quote(a) for a in c["argv"] + ["--resume", c["session"], text])
+                subprocess.run(["tmux", "send-keys", "-l", "-t", c["pane"], cmd], check=True)
+                subprocess.run(["tmux", "send-keys", "-t", c["pane"], "Enter"], check=True)
+                m = wait_for_cli(c["pane"], c["pid"], 30)
+                if not m:
+                    raise RuntimeError("no Claude Code started in the pane in 30 s; check the pane")
+            c["session"] = m.get("sessionId") or c["session"]
+            print(f"  {c['name']}: Remote Control {ensure_remote_control(c['pane'], c['name'])}")
+            restarted.append(c)
+        except Exception as error:  # one pane failing leaves the rest to try
+            print(f"  {c['name']}: {error}")
+    return restarted
+
+
+def transcript(cli_id):
+    return next((p for p in (Path.home() / ".claude/projects").glob(f"*/{cli_id}.jsonl")), None) if cli_id else None
+
+
+def answered(cli_id, since):
+    """Whether a transcript has an assistant entry after `since` (epoch s), and its last text."""
+    path, last, seen = transcript(cli_id), "", False
+    if not path:
+        return False, "no transcript"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(since))
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant" or str(entry.get("timestamp", "")) < stamp:
+            continue
+        seen = True
+        content = (entry.get("message") or {}).get("content") or []
+        texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        if any(t.strip() for t in texts):
+            last = " ".join(" ".join(texts).split())
+    return seen, last
+
+
+def report_wakes(woken, since, scope):
+    """After the wake, say per session whether it answered; the wake text alone proves nothing."""
+    if not woken:
+        return
+    time.sleep(60)
+    print("wake report (assistant turns since the wake; read each reply for its helper check):")
+    for title, cli_id in woken:
+        seen, last = answered(cli_id, since)
+        state = "answered" if seen else "NO ANSWER yet"
+        print(f"  {title}: {state}" + (f" — {last[:200]}" if last else ""))
 
 
 def archive_offline_remote_rows(dry):
@@ -378,6 +530,8 @@ def archive_offline_remote_rows(dry):
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         sys.exit(__doc__)
+    if argv[0] == "--wake-only":
+        return wake_only(argv[1] if len(argv) > 1 else "")
     dry = "--dry-run" in argv
     if not dry and os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop":
         # Quitting the app kills this app session's process group, and this script
@@ -392,6 +546,7 @@ def main(argv):
         sys.exit(f"started in tmux, outside the app, which quits now; log: {log}")
     slot, acct = resolve(argv[0])
     scope = f"{acct['uuid']}/{acct['organizationUuid']}"
+    check_login(slot, acct)
     chosen = wake_choice(argv[argv.index("--wake") + 1]) if "--wake" in argv else None
     dst = profile_dir(slot, acct)
     # The profile left: `--from`, else the account the last switch opened, else the other one used last
@@ -474,10 +629,16 @@ def main(argv):
         result = sidebar_state.diff(source_side, target_side)
         print(yaml.safe_dump({"source baseline -> target": result}, sort_keys=False, allow_unicode=True))
     wake_side = source_side if dry else target_side
+    since = time.time()
+    woken = {}
     if wake_side is not None:
-        wake(wake_side, acct["email"], dry, awake, primary_session(dst))
-    restart_remote_control(acct["email"], dry, rc_clis)
+        woken = wake(wake_side, acct["email"], dry, awake, primary_session(dst)) or {}
+    restarted = restart_remote_control(acct["email"], dry, rc_clis)
     archive_offline_remote_rows(dry)
+    if not dry:
+        cli_ids = {f.stem: (record(f) or {}).get("cliSessionId") for f in (SESSIONS / scope).glob("local_*.json")}
+        report_wakes([(t, cli_ids.get(i)) for i, t in woken.items()] +
+                     [(c["name"], c["session"]) for c in restarted], since, scope)
     if dry and baseline_issues:
         print("INCONCLUSIVE baseline: dry-run plan printed, but stored sidebar data has unresolved issues.")
         sys.exit(2)
@@ -694,27 +855,53 @@ def wake(side, email, dry, awake=None, primary=None):
         print(f"leaving {idle} session(s) asleep")
     else:
         print("no record of which sessions ran before the switch; waking every live one")
-    text = WAKE_TEXT.format(email=email)
+    text = WAKE_TEXT.format(email=email) + WAKE_SUFFIX
     print(f"{'would wake' if dry else 'waking'} {len(sessions)} session(s) from this session")
     for sid, title in sessions.items():
         print(f"  {title} ({sid})")
     if dry:
-        return
+        return {}
     # The opened app restores its panes and pop-outs with a process, which is all an idle
     # one needs; a turn the quit cut short still needs the prompt, so none is skipped.
     time.sleep(15)
+    asked = dict(sessions)
     sessions = wake_here(sessions, text, primary)
+    woken = {i: t for i, t in asked.items() if i not in sessions}
     if not sessions:
-        return
+        return woken
     ids = "\n".join(f"- {i} ({t})" for i, t in sessions.items())
     print(f"{len(sessions)} not woken from here; open each and send the wake prompt:\n{ids}")
     if not WAKER_CMD:
         return
     out = subprocess.run(shlex.split(WAKER_CMD) + [f"Wake these app sessions after the account switch with "
                     f"SendMessage to each id, text: '{text}'. When your own id is listed, do what that text says yourself after the others. The app stops your messages to "
-                    f"other app sessions after 10, so wake at most 10 and report the rest back. "
+                    f"other app sessions after 10, so wake at most 10 that way and the rest with `{WAKE_ONLY} <id,…>`. "
                     f"Sessions:\n{ids}"], capture_output=True, text=True)
     print(out.stdout.strip() or out.stderr.strip())
+    return woken
+
+
+def wake_only(names):
+    """Wake the named app sessions in the running app, as the switch does, with no per-sender cap."""
+    if not names:
+        sys.exit("--wake-only needs session titles or local ids, comma-separated")
+    if not app_pids():
+        sys.exit("the Claude app is not running")
+    chosen = wake_choice(names)
+    titles = {}
+    for sid in chosen:
+        recs = [record(f) or {} for f in SESSIONS.glob(f"*/*/{sid}.json")]
+        titles[sid] = max(recs, key=lambda r: r.get("lastActivityAt", 0), default={}).get("title", sid)
+    try:
+        data = json.loads(subprocess.run(["cswap", "list", "--json"], capture_output=True, text=True, timeout=90).stdout)
+        email = next(a["email"] for a in data["accounts"] if a.get("active"))
+    except (OSError, ValueError, KeyError, StopIteration, subprocess.TimeoutExpired):
+        email = "the current account"
+    print(f"waking {len(titles)} session(s)")
+    failed = wake_here(titles, WAKE_TEXT.format(email=email) + WAKE_SUFFIX, None)
+    if failed:
+        print("not woken:\n" + "\n".join(f"- {i} ({t})" for i, t in failed.items()))
+    return 1 if failed else 0
 
 
 def backup_sessions():

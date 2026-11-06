@@ -94,8 +94,24 @@ def test_tree_uses_section_order_recency_and_distinct_ids():
                      "local_b": {"title": "same", "group": "Second", "archived": False, "lastActivityAt": "2026-01-02"}},
         "routines": [], "problems": []}}
     text = mod.render_tree(state)
-    assert text.index("Second (2) [collapsed]") < text.index("First (hidden)")
+    assert text.index("Second (2) [collapsed, sort: recency descending, not Date created descending]") < text.index("First (hidden)")
     assert text.index("local_b") < text.index("local_a")
+
+
+def test_tree_lists_rows_and_helpers_newest_created_first():
+    mod = importlib.import_module("sidebar_state")
+    row = lambda created, active, **extra: {"title": created, "group": "Work", "archived": False,
+                                            "createdAt": created, "lastActivityAt": active, **extra}
+    state = {"scope": {"groups": ["Work"], "sections": [
+        {"kind": "manual", "name": "Work", "sortBy": "created", "ascending": False}],
+        "sessions": {"local_old": row("2026-01-01", "2026-03-01"),
+                     "local_new": row("2026-02-01", "2026-02-02"),
+                     "local_kid_old": row("2026-01-02", "2026-03-05", parent="local_old"),
+                     "local_kid_new": row("2026-01-03", "2026-01-04", parent="local_old")},
+        "routines": [], "problems": []}}
+    text = mod.render_tree(state)
+    assert "Work (2)\n" in text
+    assert text.index("local_new") < text.index("local_old") < text.index("local_kid_new") < text.index("local_kid_old")
 
 
 def test_group_copy_normalizes_account_specific_ids_and_keeps_manual_order():

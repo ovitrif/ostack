@@ -131,7 +131,7 @@ def read_scope(folder, scope, app_state):
     for section in main.get("sections", []):
         if section.get("kind") not in ("manual", "pinned", "routines", "sessions"):
             problems.append({"unsupported_section": section})
-        if section.get("sortBy", "recency") not in ("recency", "manual", "title", "name", "alphabetical"):
+        if section.get("sortBy", "recency") not in ("recency", "created", "manual", "title", "name", "alphabetical"):
             problems.append({"unsupported_sort": section})
         if section.get("groupBy", "none") != "none":
             problems.append({"unsupported_grouping": section})
@@ -150,6 +150,7 @@ def read_scope(folder, scope, app_state):
             "cwd": r.get("cwd"),
             "archived": archived or sid in idx,
             "lastActivityAt": iso(r.get("lastActivityAt")),
+            "createdAt": iso(r.get("createdAt")),
             "bridge": bool(r.get("bridgeSessionIds")),
             "group": main["members"].get(sid),
             "pinned": sid in pins or bool(r.get("isStarred")),
@@ -332,7 +333,21 @@ def render_tree(state, label="sidebar"):
         accounted = set()
         omitted = []
         nested = {sid: row["parent"] for sid, row in live.items() if row.get("parent") in live and not row.get("side_chat")}
-        def emit_row(sid, row, depth=1, ancestors=()):
+        def order_rows(rows, section, name, flags):
+            sort = section.get("sortBy", "recency")
+            if sort == "recency":
+                rows.sort(key=lambda row: (str(row[1].get("lastActivityAt") or ""), row[0]), reverse=not section.get("ascending", False))
+            elif sort == "created":
+                rows.sort(key=lambda row: (str(row[1].get("createdAt") or ""), row[0]), reverse=not section.get("ascending", False))
+            elif sort in ("title", "name", "alphabetical"):
+                rows.sort(key=lambda row: ((row[1].get("title") or "").casefold(), row[0]), reverse=not section.get("ascending", True))
+            elif sort == "manual":
+                order = side_state.get("member_order", {}).get(name, [])
+                rows.sort(key=lambda row: (order.index(row[0]) if row[0] in order else len(order), row[0]))
+            else:
+                flags.append(f"unsupported sort: {sort}; listed by ID")
+                rows.sort()
+        def emit_row(sid, row, depth=1, ancestors=(), section=None, name=None):
             if sid in ancestors:
                 lines.append("  " * depth + f"! cyclic parent relationship [{sid}]")
                 return
@@ -340,9 +355,9 @@ def render_tree(state, label="sidebar"):
             title = " ".join(str(row.get("title") or "(untitled)").splitlines())
             lines.append("  " * depth + f"- {title}  [{sid}]" + (" *" if row.get("pinned") else ""))
             children = [(i, v) for i, v in live.items() if nested.get(i) == sid]
-            children.sort(key=lambda item: (str(item[1].get("lastActivityAt") or ""), item[0]), reverse=True)
+            order_rows(children, section or {}, name, [])
             for child_id, child in children:
-                emit_row(child_id, child, depth + 1, (*ancestors, sid))
+                emit_row(child_id, child, depth + 1, (*ancestors, sid), section, name)
         for section in sections:
             kind = section.get("kind")
             name = {"pinned": "Pinned", "routines": "Routines", "sessions": "Recents"}.get(kind, section.get("name", "Unknown"))
@@ -369,20 +384,12 @@ def render_tree(state, label="sidebar"):
             if not rows and kind != "sessions" and not section.get("show", {}).get("emptyGroups", False):
                 omitted.append(f"{name} (empty)")
                 continue
-            sort = section.get("sortBy", "recency")
-            if sort == "recency":
-                rows.sort(key=lambda row: (str(row[1].get("lastActivityAt") or ""), row[0]), reverse=not section.get("ascending", False))
-            elif sort in ("title", "name", "alphabetical"):
-                rows.sort(key=lambda row: ((row[1].get("title") or "").casefold(), row[0]), reverse=not section.get("ascending", True))
-            elif sort == "manual":
-                order = side_state.get("member_order", {}).get(name, [])
-                rows.sort(key=lambda row: (order.index(row[0]) if row[0] in order else len(order), row[0]))
-            else:
-                flags.append(f"unsupported sort: {sort}; listed by ID")
-                rows.sort()
+            order_rows(rows, section, name, flags)
+            if (section.get("sortBy", "recency"), bool(section.get("ascending", False))) != ("created", False):
+                flags.append(f"sort: {section.get('sortBy', 'recency')} {'ascending' if section.get('ascending') else 'descending'}, not Date created descending")
             lines.append(f"{name} ({len(rows)})" + (f" [{', '.join(flags)}]" if flags else ""))
             for sid, row in rows:
-                emit_row(sid, row)
+                emit_row(sid, row, section=section, name=name)
         leftovers = sorted(sid for sid in set(live) - accounted if not live[sid].get("side_chat"))
         hidden_side_chats = sum(bool(v.get("side_chat")) for i, v in live.items() if i not in accounted)
         if omitted or hidden_side_chats:

@@ -193,3 +193,73 @@ def test_the_left_accounts_sidebar_wins(tmp_path, monkeypatch):
     assert got["gone"]["isArchived"] is True  # deleted on the account left
     assert "only-there" in got  # a live session the left account lacks still comes
     assert json.loads((target / "archived-sessions.idx").read_text())["archived"] == ["local_gone", "local_old"]
+
+
+def _mod(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    sys.modules.pop("app_switch", None)
+    return importlib.import_module("app_switch")
+
+
+def test_a_dead_target_login_stops_the_switch(monkeypatch):
+    import pytest
+    mod = _mod(monkeypatch)
+
+    class Out:
+        stdout = json.dumps({"accounts": [{"number": 2, "usageStatus": "re-login needed"},
+                                          {"number": 1, "usageStatus": "ok"}]})
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: Out)
+    with pytest.raises(SystemExit) as stop:
+        mod.check_login("2", {"email": "b@x"})
+    assert "re-login needed" in str(stop.value) and "cswap add" in str(stop.value)
+    mod.check_login("1", {"email": "a@x"})  # a working login passes
+
+
+def test_keeper_counts_only_a_launch_agent_resuming_this_session(tmp_path, monkeypatch):
+    import plistlib
+    mod = _mod(monkeypatch)
+    monkeypatch.setattr(mod.Path, "home", lambda: tmp_path)
+    agents = tmp_path / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for label, prog in (("com.example.session.memory", "keeper.py run --name memory --resume s-1"),
+                        ("com.example.session.security", "keeper.py run --name security")):
+        (agents / f"{label}.plist").write_bytes(plistlib.dumps({"ProgramArguments": ["/bin/zsh", "-lc", prog]}))
+
+    class Out:
+        stdout = "PID\tStatus\tLabel\n1\t0\tcom.example.session.memory\n2\t0\tcom.example.session.security\n"
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: Out)
+    assert mod.keeper("memory", "s-1") == "com.example.session.memory"
+    assert mod.keeper("memory", "s-2") is None  # it would resume another conversation
+    assert mod.keeper("security", "s-3") is None  # it would start a fresh one
+
+
+def test_an_unkept_pane_not_on_a_shell_is_never_typed_into(monkeypatch, capsys):
+    mod = _mod(monkeypatch)
+    sent = []
+    monkeypatch.setattr(mod, "keeper", lambda name, sid: None)
+    monkeypatch.setattr(mod, "pane_cli", lambda pane, old=None: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mod, "tmux_out", lambda *a: "work" if "#{session_name}" in a else "node")
+
+    def run(cmd, **k):
+        sent.append(cmd)
+        return type("R", (), {"stdout": "", "returncode": 0})
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    out = mod.restart_remote_control("a@x", False, [{"pid": 1, "pane": "%3", "name": "w", "session": "s",
+                                                     "argv": ["claude"], "prefix": ""}])
+    assert out == [] and not any("send-keys" in c for c in sent)
+    assert "not a shell" in capsys.readouterr().out
+
+
+def test_wake_report_reads_assistant_turns_after_the_wake(tmp_path, monkeypatch):
+    mod = _mod(monkeypatch)
+    monkeypatch.setattr(mod.Path, "home", lambda: tmp_path)
+    proj = tmp_path / ".claude/projects/p"
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"type": "assistant", "timestamp": "2026-11-06T10:00:00Z", "message": {"content": [{"type": "text", "text": "old"}]}},
+        {"type": "user", "timestamp": "2026-11-06T12:00:00Z"},
+        {"type": "assistant", "timestamp": "2026-11-06T12:00:05Z", "message": {"content": [{"type": "text", "text": "helpers checked"}]}}]))
+    since = mod.time.mktime(mod.time.strptime("2026-11-06T11:00:00", "%Y-%m-%dT%H:%M:%S")) - mod.time.timezone
+    assert mod.answered("c1", since) == (True, "helpers checked")
+    assert mod.answered("c2", since) == (False, "no transcript")
